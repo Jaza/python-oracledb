@@ -149,6 +149,8 @@ cdef class ThinDbObjectTypeCache:
     cdef:
         object meta_cursor, columns_cursor, attrs_ref_cursor_var, version_var
         object return_value_var, full_name_var, oid_var, tds_var
+        object meta_blob_cursor, tds_blob_var
+        bytes tds
         object schema_var, package_name_var, name_var
         ThinConnImpl conn_impl
         dict types_by_oid
@@ -173,6 +175,10 @@ cdef class ThinDbObjectTypeCache:
             self.schema_var = None
             self.package_name_var = None
             self.name_var = None
+        if self.meta_blob_cursor is not None:
+            self.meta_blob_cursor.close()
+            self.meta_blob_cursor = None
+            self.tds_blob_var = None
         if self.columns_cursor is not None:
             self.columns_cursor.close()
             self.columns_cursor = None
@@ -225,8 +231,31 @@ cdef class ThinDbObjectTypeCache:
         self.oid_var = cursor.var(bytes)
         self.version_var = cursor.var(DB_TYPE_BINARY_INTEGER)
         self.attrs_ref_cursor_var = cursor.var(DB_TYPE_CURSOR)
+        self._prepare_meta_cursor(cursor, self.tds_var)
+        self.meta_cursor = cursor
+
+    cdef int _init_meta_blob_cursor(self, object conn) except -1:
+        """
+        Initializes the cursor that fetches the type metadata using a BLOB for
+        the TDS instead of RAW. This is only used when the TDS is too large to
+        fit in a RAW (4000 or 32767 bytes, depending on the database setting
+        of MAX_STRING_SIZE), since the use of a temporary LOB requires an
+        additional round trip. All variables other than the TDS are shared
+        with the meta cursor (which must already have been initialized).
+        """
+        cursor = conn.cursor()
+        self.tds_blob_var = cursor.var(DB_TYPE_BLOB)
+        self._prepare_meta_cursor(cursor, self.tds_blob_var)
+        self.meta_blob_cursor = cursor
+
+    cdef int _prepare_meta_cursor(self, object cursor,
+                                  object tds_var) except -1:
+        """
+        Binds the variables and prepares the statement for a cursor that
+        fetches the type metadata.
+        """
         cursor.setinputsizes(ret_val=self.return_value_var,
-                             tds=self.tds_var,
+                             tds=tds_var,
                              full_name=self.full_name_var,
                              oid=self.oid_var,
                              schema=self.schema_var,
@@ -235,7 +264,6 @@ cdef class ThinDbObjectTypeCache:
                              version=self.version_var,
                              attrs_rc=self.attrs_ref_cursor_var)
         cursor.prepare(DBO_CACHE_SQL_GET_METADATA_FOR_NAME)
-        self.meta_cursor = cursor
 
     cdef object _parse_tds(self, ThinDbObjectTypeImpl typ_impl, bytes tds):
         """
@@ -491,7 +519,29 @@ cdef class ThinDbObjectTypeCache:
         if self.meta_cursor is None:
             self._init_meta_cursor(conn)
         self.full_name_var.setvalue(0, name)
-        yield from self.meta_cursor._execute(None)
+        # when the TDS is too large to fit in a RAW, get_type_shape() either
+        # raises ORA-06502 (TDS exceeds the maximum size of a RAW, which is
+        # 4000 bytes when MAX_STRING_SIZE is STANDARD) or returns 24331
+        # (ORA-24331: user buffer too small, when the TDS approaches or
+        # exceeds 32767 bytes); since this is uncommon, try again using a BLOB
+        # only in that case in order to avoid the extra round trip that a
+        # temporary LOB requires
+        try:
+            yield from self.meta_cursor._execute(None)
+            use_blob = \
+                (self.return_value_var.getvalue() == TNS_ERR_BUFFER_TOO_SMALL)
+        except exceptions.DatabaseError as e:
+            if e.args[0].code != TNS_ERR_VALUE_ERROR:
+                raise
+            use_blob = True
+        if not use_blob:
+            self.tds = self.tds_var.getvalue()
+        else:
+            if self.meta_blob_cursor is None:
+                self._init_meta_blob_cursor(conn)
+            yield from self.meta_blob_cursor._execute(None)
+            lob = self.tds_blob_var.getvalue()
+            self.tds = None if lob is None else (yield from lob._read())
         if self.return_value_var.getvalue() != 0:
             errors._raise_err(errors.ERR_INVALID_OBJECT_TYPE_NAME, name=name)
         if name.endswith("%ROWTYPE"):
@@ -550,7 +600,7 @@ cdef class ThinDbObjectTypeCache:
                 self._create_attr(typ_impl, attr_name, attr_type_name,
                                   attr_type_owner, attr_type_package,
                                   attr_type_oid)
-            self._parse_tds(typ_impl, self.tds_var.getvalue())
+            self._parse_tds(typ_impl, self.tds)
             if typ_impl.is_collection:
                 if typ_impl.element_metadata.dbtype is DB_TYPE_CLOB:
                     yield from self._get_element_type_clob(typ_impl)

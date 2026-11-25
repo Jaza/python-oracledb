@@ -999,3 +999,236 @@ def test_data_types_1949(skip_unless_thin_mode, cursor):
     assert obj.NUMBERVALUE == num_val
     assert obj.XMLVALUE is None
     assert obj.STRINGVALUE == str_val
+
+
+# when the TDS of a type is too large to fit in a RAW, the thin driver tries
+# again using a BLOB; dbms_pickler.get_type_shape() reports this condition in
+# one of two ways, so a type is created for each of them:
+#
+# - a medium type has 1000 varchar2 attributes (8 bytes each), which results
+#   in a TDS of about 8,000 bytes; this exceeds 4000 bytes (the maximum size
+#   of a RAW when MAX_STRING_SIZE is STANDARD) and results in ORA-06502 being
+#   raised
+#
+# - a large type is created from an inner type with 100 varchar2 attributes
+#   and an outer type with 50 attributes of that inner type (the TDS of a type
+#   includes the TDS of any embedded object types), which results in a TDS of
+#   about 40,000 bytes; this exceeds 32767 bytes (the maximum size of a RAW
+#   when MAX_STRING_SIZE is EXTENDED) and results in the error 24331 being
+#   returned, while keeping the number of attributes in each type within the
+#   limit of 1000
+MEDIUM_TYPE_NUM_ATTRS = 1000
+LARGE_TYPE_INNER_NUM_ATTRS = 100
+LARGE_TYPE_OUTER_NUM_ATTRS = 50
+
+GET_TYPE_SHAPE_SQL = """
+    declare
+        t_Oid                       raw(16);
+        t_Version                   pls_integer;
+        t_Instantiable              varchar2(3);
+        t_SuperTypeOwner            varchar2(128);
+        t_SuperTypeName             varchar2(128);
+        t_AttrsRefCursor            sys_refcursor;
+        t_SubTypeRefCursor          sys_refcursor;
+    begin
+        :ret_val := dbms_pickler.get_type_shape(:full_name, t_Oid,
+            t_Version, :tds, t_Instantiable, t_SuperTypeOwner,
+            t_SuperTypeName, t_AttrsRefCursor, t_SubTypeRefCursor);
+    end;"""
+
+
+@pytest.fixture
+def skip_unless_max_string_size_standard(admin_conn):
+    with admin_conn.cursor() as cursor:
+        cursor.execute(
+            "select value from v$parameter where name = 'max_string_size'"
+        )
+        (value,) = cursor.fetchone()
+    if value != "STANDARD":
+        pytest.skip("requires MAX_STRING_SIZE to be STANDARD")
+
+
+def _create_type(cursor, type_name, num_attrs, attr_type="varchar2(10)"):
+    attrs = ", ".join(f"attr{i} {attr_type}" for i in range(num_attrs))
+    cursor.execute(f"create or replace type {type_name} as object ({attrs})")
+
+
+def _create_medium_type(cursor, type_name):
+    """
+    Creates a medium type and returns the names of the types that were
+    created, in the order in which they need to be dropped.
+    """
+    _create_type(cursor, type_name, MEDIUM_TYPE_NUM_ATTRS)
+    return [type_name]
+
+
+def _create_large_type(cursor, type_name):
+    """
+    Creates a large type and returns the names of the types that were created,
+    in the order in which they need to be dropped.
+    """
+    inner_type_name = f"{type_name}_INNER"
+    _create_type(cursor, inner_type_name, LARGE_TYPE_INNER_NUM_ATTRS)
+    _create_type(
+        cursor, type_name, LARGE_TYPE_OUTER_NUM_ATTRS, inner_type_name
+    )
+    return [type_name, inner_type_name]
+
+
+def _test_fallback_round_trips(
+    conn, round_trip_checker, test_num, create_type_func, num_attrs
+):
+    """
+    Verifies that getting a type whose TDS is too large for a RAW requires
+    additional round trips but does not affect subsequent lookups.
+    """
+    small_type_names = [
+        f"UDT_SMALLOBJECT_{test_num}_A",
+        f"UDT_SMALLOBJECT_{test_num}_B",
+    ]
+    big_type_name = f"UDT_BIGOBJECT_{test_num}"
+    with conn.cursor() as cursor:
+        for type_name in small_type_names:
+            _create_type(cursor, type_name, 5)
+        type_names = small_type_names + create_type_func(
+            cursor, big_type_name
+        )
+    try:
+        round_trip_checker.get_value()
+        typ = conn.gettype(small_type_names[0])
+        small_round_trips = round_trip_checker.get_value()
+        assert len(typ.attributes) == 5
+
+        # the big type requires additional round trips: one for the attempt
+        # using RAW and one for reading the BLOB
+        typ = conn.gettype(big_type_name)
+        big_round_trips = round_trip_checker.get_value()
+        assert len(typ.attributes) == num_attrs
+        assert big_round_trips >= small_round_trips + 2
+
+        # subsequent lookups of small types continue to use RAW
+        typ = conn.gettype(small_type_names[1])
+        assert round_trip_checker.get_value() == small_round_trips
+        assert len(typ.attributes) == 5
+    finally:
+        with conn.cursor() as cursor:
+            for type_name in type_names:
+                cursor.execute(f"drop type {type_name}")
+
+
+def test_data_types_1950(conn, cursor):
+    "1950 - test getting a type whose TDS is too large for a RAW (#641)"
+    type_name = "UDT_LARGEOBJECT_1950"
+    type_names = _create_large_type(cursor, type_name)
+    try:
+        # verify that the TDS is too large for a RAW and results in error
+        # 24331 being returned (and not ORA-06502 being raised)
+        ret_val = cursor.var(int)
+        cursor.execute(
+            GET_TYPE_SHAPE_SQL,
+            ret_val=ret_val,
+            full_name=type_name,
+            tds=cursor.var(bytes),
+        )
+        assert ret_val.getvalue() == 24331
+        typ = conn.gettype(type_name)
+        assert typ.name == type_name
+        assert [a.name for a in typ.attributes] == [
+            f"ATTR{i}" for i in range(LARGE_TYPE_OUTER_NUM_ATTRS)
+        ]
+        inner_typ = typ.attributes[0].type
+        assert inner_typ.name == f"{type_name}_INNER"
+        assert all(a.type == inner_typ for a in typ.attributes)
+        assert [a.name for a in inner_typ.attributes] == [
+            f"ATTR{i}" for i in range(LARGE_TYPE_INNER_NUM_ATTRS)
+        ]
+        assert all(
+            a.type is oracledb.DB_TYPE_VARCHAR and a.max_size == 10
+            for a in inner_typ.attributes
+        )
+        obj = typ.newobject()
+        for i in range(0, LARGE_TYPE_OUTER_NUM_ATTRS, 7):
+            inner_obj = inner_typ.newobject()
+            for j in range(0, LARGE_TYPE_INNER_NUM_ATTRS, 11):
+                setattr(inner_obj, f"ATTR{j}", f"value{i}_{j}")
+            setattr(obj, f"ATTR{i}", inner_obj)
+        cursor.execute("select :1 from dual", [obj])
+        (fetched_obj,) = cursor.fetchone()
+        assert fetched_obj.type.name == type_name
+        for i in range(LARGE_TYPE_OUTER_NUM_ATTRS):
+            inner_obj = getattr(fetched_obj, f"ATTR{i}")
+            if i % 7 != 0:
+                assert inner_obj is None
+                continue
+            for j in range(LARGE_TYPE_INNER_NUM_ATTRS):
+                expected_value = f"value{i}_{j}" if j % 11 == 0 else None
+                assert getattr(inner_obj, f"ATTR{j}") == expected_value
+    finally:
+        for name in type_names:
+            cursor.execute(f"drop type {name}")
+
+
+def test_data_types_1951(skip_unless_thin_mode, conn, round_trip_checker):
+    "1951 - test large TDS fallback does not affect subsequent lookups"
+    _test_fallback_round_trips(
+        conn,
+        round_trip_checker,
+        1951,
+        _create_large_type,
+        LARGE_TYPE_OUTER_NUM_ATTRS,
+    )
+
+
+def test_data_types_1952(
+    skip_unless_max_string_size_standard, conn, cursor, test_env
+):
+    "1952 - test getting a type whose TDS raises ORA-06502 for a RAW (#641)"
+    type_name = "UDT_MEDIUMOBJECT_1952"
+    type_names = _create_medium_type(cursor, type_name)
+    try:
+        # verify that the TDS is too large for a RAW and results in ORA-06502
+        # being raised (and not error 24331 being returned)
+        with test_env.assert_raises_full_code("ORA-06502"):
+            cursor.execute(
+                GET_TYPE_SHAPE_SQL,
+                ret_val=cursor.var(int),
+                full_name=type_name,
+                tds=cursor.var(bytes),
+            )
+        typ = conn.gettype(type_name)
+        assert typ.name == type_name
+        assert [a.name for a in typ.attributes] == [
+            f"ATTR{i}" for i in range(MEDIUM_TYPE_NUM_ATTRS)
+        ]
+        assert all(
+            a.type is oracledb.DB_TYPE_VARCHAR and a.max_size == 10
+            for a in typ.attributes
+        )
+        obj = typ.newobject()
+        for i in range(0, MEDIUM_TYPE_NUM_ATTRS, 111):
+            setattr(obj, f"ATTR{i}", f"value{i}")
+        cursor.execute("select :1 from dual", [obj])
+        (fetched_obj,) = cursor.fetchone()
+        assert fetched_obj.type.name == type_name
+        for i in range(MEDIUM_TYPE_NUM_ATTRS):
+            expected_value = f"value{i}" if i % 111 == 0 else None
+            assert getattr(fetched_obj, f"ATTR{i}") == expected_value
+    finally:
+        for name in type_names:
+            cursor.execute(f"drop type {name}")
+
+
+def test_data_types_1953(
+    skip_unless_thin_mode,
+    skip_unless_max_string_size_standard,
+    conn,
+    round_trip_checker,
+):
+    "1953 - test medium TDS fallback does not affect subsequent lookups"
+    _test_fallback_round_trips(
+        conn,
+        round_trip_checker,
+        1953,
+        _create_medium_type,
+        MEDIUM_TYPE_NUM_ATTRS,
+    )
